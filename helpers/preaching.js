@@ -202,7 +202,10 @@ const calculateMessageInterval = (group) => {
   const remainingHours = getRemainingHoursToday();
   let intervalHours = remainingHours / messagesRemaining;
   
-  if (intervalHours < 1) {
+  // If there's very little time left, allow sending immediately (minimum 0.1 hours = 6 minutes)
+  if (intervalHours < 0.1) {
+    intervalHours = 0.1;
+  } else if (intervalHours < 1) {
     intervalHours = 1;
   }
   
@@ -210,7 +213,9 @@ const calculateMessageInterval = (group) => {
     intervalHours = 6;
   }
   
-  return intervalHours * 60 * 60 * 1000;
+  const intervalMs = intervalHours * 60 * 60 * 1000;
+  
+  return intervalMs;
 };
 
 // Calculate how many messages a group should have sent since last message
@@ -491,7 +496,26 @@ const getNextEarliestReadyTime = async () => {
     const accounts = await Account.find({ admin: false });
     let earliestReadyTime = null;
     let earliestGroupInfo = null;
+    const today = getTodayDate();
     
+    // FIRST: Check if any group hasn't sent today (should send immediately)
+    for (const account of accounts) {
+      for (const group of account.groups) {
+        if (hasReachedDailyLimit(group)) {
+          continue;
+        }
+        
+        const todayTracker = group.dailyTracker?.find(t => t.date === today);
+        
+        // If no tracker for today OR no lastSentAt, group is ready NOW
+        if (!todayTracker || !todayTracker.lastSentAt) {
+          console.log(`  🔍 Found group ready to send: ${account.number}:${group.name} (no messages sent today)`);
+          return { readyTime: 0, groupInfo: `${account.number}:${group.name}` };
+        }
+      }
+    }
+    
+    // SECOND: If all groups have sent today, find the next one ready
     for (const account of accounts) {
       for (const group of account.groups) {
         if (hasReachedDailyLimit(group)) {
@@ -503,10 +527,10 @@ const getNextEarliestReadyTime = async () => {
           continue;
         }
         
-        const today = getTodayDate();
         const todayTracker = group.dailyTracker?.find(t => t.date === today);
         
         if (!todayTracker || !todayTracker.lastSentAt) {
+          // This shouldn't happen since we checked above, but just in case
           return { readyTime: 0, groupInfo: `${account.number}:${group.name}` };
         }
         
@@ -524,6 +548,7 @@ const getNextEarliestReadyTime = async () => {
       }
     }
     
+    // If no groups found, all are done for today
     if (earliestReadyTime === null) {
       return { readyTime: 10 * 60 * 1000, groupInfo: null };
     }
@@ -629,36 +654,47 @@ const processAccount = async (account) => {
     let messagesSent = 0;
     let localMessageId = account.currentMessageId || 0;
     
+    console.log(`  🔍 [${account.number}] Processing ${account.groups.length} groups...`);
+    
     for (const group of account.groups) {
       if (!preachingActive || preachingController?.signal.aborted) {
         break;
       }
       
       if (hasReachedDailyLimit(group)) {
-        continue;
-      }
-      
-      const requiredInterval = calculateMessageInterval(group);
-      
-      if (requiredInterval === null) {
+        console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - daily limit reached`);
         continue;
       }
       
       const today = getTodayDate();
       const todayTracker = group.dailyTracker?.find(t => t.date === today);
       
-      // Only check interval if we have a tracker for TODAY
-      // Ignore old trackers from previous days
-      if (todayTracker && todayTracker.lastSentAt) {
+      // If no tracker exists for today, send immediately (first message of the day)
+      if (!todayTracker || !todayTracker.lastSentAt) {
+        console.log(`  ✅ [${account.number}] ${group.name} is ready to send (first message today)`);
+      } else {
+        // Check interval only if we've already sent messages today
+        const requiredInterval = calculateMessageInterval(group);
+        
+        if (requiredInterval === null) {
+          console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - interval calculation returned null`);
+          continue;
+        }
+        
         const timeSinceLastSend = Date.now() - new Date(todayTracker.lastSentAt).getTime();
         
         if (timeSinceLastSend < requiredInterval) {
+          const waitMinutes = Math.ceil((requiredInterval - timeSinceLastSend) / (1000 * 60));
+          console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - need to wait ${waitMinutes} more minutes`);
           continue;
         }
+        
+        console.log(`  ✅ [${account.number}] ${group.name} is ready to send (interval: ${Math.ceil(requiredInterval / (1000 * 60))} min)`);
       }
       
       const catchUpResult = await handleCatchUp(group, account, localMessageId);
       if (!catchUpResult.shouldSend) {
+        console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - catchUp returned shouldSend: false`);
         continue;
       }
       
@@ -753,7 +789,22 @@ const processAccount = async (account) => {
     if (messagesSent > 0) {
       console.log(`  ✅ ${account.number}: ${messagesSent} messages sent`);
     } else {
-      console.log(`  ℹ️  ${account.number}: No messages sent this cycle`);
+      // Check if there are groups that should have sent but didn't
+      const today = getTodayDate();
+      let groupsNeedingMessages = 0;
+      for (const group of account.groups) {
+        if (hasReachedDailyLimit(group)) continue;
+        const tracker = group.dailyTracker?.find(t => t.date === today);
+        if (!tracker || !tracker.lastSentAt || tracker.messageCount === 0) {
+          groupsNeedingMessages++;
+        }
+      }
+      
+      if (groupsNeedingMessages > 0) {
+        console.log(`  ⚠️  ${account.number}: No messages sent but ${groupsNeedingMessages} groups need messages today!`);
+      } else {
+        console.log(`  ℹ️  ${account.number}: No messages sent this cycle`);
+      }
     }
     
   } catch (error) {
@@ -820,10 +871,34 @@ export async function startPreaching(ctx) {
 
         console.log('✅ Cycle complete\n');
 
+        // Check if there are any groups that haven't sent today
+        const today = getTodayDate();
+        let hasGroupsNeedingMessages = false;
+        const allAccounts = await Account.find({ admin: false });
+        for (const acc of allAccounts) {
+          for (const grp of acc.groups) {
+            if (hasReachedDailyLimit(grp)) {
+              continue;
+            }
+            const tracker = grp.dailyTracker?.find(t => t.date === today);
+            if (!tracker || !tracker.lastSentAt || tracker.messageCount === 0) {
+              hasGroupsNeedingMessages = true;
+              break;
+            }
+          }
+          if (hasGroupsNeedingMessages) break;
+        }
+
         while (preachingActive && !preachingController.signal.aborted) {
           const nextReady = await getNextEarliestReadyTime();
           
+          // If groups need messages but we got "all done", something is wrong - retry immediately
           if (nextReady.readyTime === 10 * 60 * 1000 && nextReady.groupInfo === null) {
+            if (hasGroupsNeedingMessages) {
+              console.log('⚠️  Groups need messages but got "all done" - retrying immediately...\n');
+              await sleep(5000); // Short delay before retry
+              break; // Break to start new cycle
+            }
             console.log('📅 All groups done for today. Waiting until tomorrow...');
             const now = new Date();
             const tomorrow = new Date(now);
