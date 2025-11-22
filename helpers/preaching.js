@@ -560,6 +560,7 @@ const getNextEarliestReadyTime = async () => {
     
     // FIRST: Check if any group hasn't sent today (should send immediately)
     for (const account of accounts) {
+      const accountLabel = account.username ? `@${account.username}` : account.number;
       for (const group of account.groups) {
         if (hasReachedDailyLimit(group)) {
           continue;
@@ -569,13 +570,14 @@ const getNextEarliestReadyTime = async () => {
         
         // If no tracker for today OR no lastSentAt, group is ready NOW
         if (!todayTracker || !todayTracker.lastSentAt) {
-          return { readyTime: 0, groupInfo: `${account.number}:${group.name}` };
+          return { readyTime: 0, groupInfo: `${accountLabel}:${group.name}` };
         }
       }
     }
     
     // SECOND: If all groups have sent today, find the next one ready
     for (const account of accounts) {
+      const accountLabel = account.username ? `@${account.username}` : account.number;
       for (const group of account.groups) {
         if (hasReachedDailyLimit(group)) {
           continue;
@@ -590,19 +592,19 @@ const getNextEarliestReadyTime = async () => {
         
         if (!todayTracker || !todayTracker.lastSentAt) {
           // This shouldn't happen since we checked above, but just in case
-          return { readyTime: 0, groupInfo: `${account.number}:${group.name}` };
+          return { readyTime: 0, groupInfo: `${accountLabel}:${group.name}` };
         }
         
         const timeSinceLastSend = Date.now() - new Date(todayTracker.lastSentAt).getTime();
         const timeUntilReady = requiredInterval - timeSinceLastSend;
         
         if (timeUntilReady <= 0) {
-          return { readyTime: 0, groupInfo: `${account.number}:${group.name}` };
+          return { readyTime: 0, groupInfo: `${accountLabel}:${group.name}` };
         }
         
         if (earliestReadyTime === null || timeUntilReady < earliestReadyTime) {
           earliestReadyTime = timeUntilReady;
-          earliestGroupInfo = `${account.number}:${group.name}`;
+          earliestGroupInfo = `${accountLabel}:${group.name}`;
         }
       }
     }
@@ -623,7 +625,7 @@ const getNextEarliestReadyTime = async () => {
 };
 
 // Check if group has sufficient activity
-const checkGroupActivity = async (client, group, accountNumber, entityCache) => {
+const checkGroupActivity = async (client, group, accountUsername, entityCache) => {
   try {
     const me = await client.getMe();
     const myUserId = me.id.toString();
@@ -647,27 +649,27 @@ const checkGroupActivity = async (client, group, accountNumber, entityCache) => 
 
       return { hasActivity: true };
     } catch (resolveError) {
-      console.warn(`  ⚠️ [${accountNumber}] Could not check activity for ${group.name}: ${resolveError.message}`);
+      console.warn(`  ⚠️ [${accountUsername}] Could not check activity for ${group.name}: ${resolveError.message}`);
       return { hasActivity: true };
     }
 
     return { hasActivity: true };
 
   } catch (error) {
-    console.warn(`  ⚠️ [${accountNumber}] Activity check failed for ${group.name}: ${error.message}`);
+    console.warn(`  ⚠️ [${accountUsername}] Activity check failed for ${group.name}: ${error.message}`);
     return { hasActivity: true };
   }
 };
 
 // Send message to a group
-const sendMessageToGroup = async (client, group, message, accountNumber, entityCache) => {
+const sendMessageToGroup = async (client, group, message, accountUsername, accountNumber, entityCache) => {
   try {
     const entity = await resolveGroupEntity(client, group, entityCache);
     await client.sendMessage(entity, { message: message });
     return { success: true };
     
   } catch (error) {
-    console.error(`  ❌ [${accountNumber}] Failed to send to ${group.name}: ${error.message}`);
+    console.error(`  ❌ [${accountUsername}] Failed to send to ${group.name}: ${error.message}`);
     const errorResult = await handleAccountError(error, accountNumber);
     
     if (errorResult.isGroupError) {
@@ -700,13 +702,24 @@ const processAccount = async (account) => {
     
     activeClients.set(account.number, client);
     
+    // Get account username for logging
+    let accountUsername = account.username ? `@${account.username}` : account.number;
+    try {
+      const me = await client.getMe();
+      if (me.username) {
+        accountUsername = `@${me.username}`;
+      }
+    } catch (e) {
+      // Use account.username or number as fallback
+    }
+    
     // Build entity cache for efficient group resolution
     let entityCache = null;
     try {
       const dialogs = await client.getDialogs();
       entityCache = buildEntityCache(dialogs);
     } catch (error) {
-      console.warn(`  ⚠️ [${account.number}] Could not build entity cache: ${error.message}`);
+      console.warn(`  ⚠️ [${accountUsername}] Could not build entity cache: ${error.message}`);
       entityCache = new Map();
     }
     
@@ -754,7 +767,7 @@ const processAccount = async (account) => {
       
       // Validate message before sending
       if (!nextMessage.text || nextMessage.text.trim() === '') {
-        console.error(`  ❌ [${account.number}] Empty message for ${group.name} (ID: ${nextMessage.id})`);
+        console.error(`  ❌ [${accountUsername}] Empty message for ${group.name} (ID: ${nextMessage.id})`);
         localMessageId = catchUpResult.newLocalMessageId;
         await Account.updateOne(
           { _id: account._id },
@@ -765,7 +778,7 @@ const processAccount = async (account) => {
       
       console.log(`  📤 ${group.name} (${todayTracker ? todayTracker.messageCount + 1 : 1}/${group.msgPerDay})`);
       
-      const activityCheck = await checkGroupActivity(client, group, account.number, entityCache);
+      const activityCheck = await checkGroupActivity(client, group, accountUsername, entityCache);
       
       if (!activityCheck.hasActivity) {
         localMessageId = catchUpResult.newLocalMessageId;
@@ -780,7 +793,7 @@ const processAccount = async (account) => {
         continue;
       }
       
-      const result = await sendMessageToGroup(client, group, nextMessage.text, account.number, entityCache);
+      const result = await sendMessageToGroup(client, group, nextMessage.text, accountUsername, account.number, entityCache);
       
       if (result?.success) {
         localMessageId = catchUpResult.newLocalMessageId;
@@ -839,12 +852,13 @@ const processAccount = async (account) => {
         }
       }
       if (groupsNeedingMessages > 0) {
-        console.log(`  ⚠️  ${account.number}: ${groupsNeedingMessages} groups need messages`);
+        console.log(`  ⚠️  ${accountUsername}: ${groupsNeedingMessages} groups need messages`);
       }
     }
     
   } catch (error) {
-    console.error(`Error processing ${account.number}:`, error.message);
+    const accountUsername = account.username ? `@${account.username}` : account.number;
+    console.error(`Error processing ${accountUsername}:`, error.message);
     await handleAccountError(error, account.number);
   } finally {
     if (client && client.connected) {
