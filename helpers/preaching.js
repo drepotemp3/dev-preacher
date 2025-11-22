@@ -419,47 +419,95 @@ const updateDailyTracker = async (accountId, groupId) => {
   }
 };
 
-// Update daily tracker after successful message send
+// Update daily tracker after successful message send (using atomic update to avoid version conflicts)
 const incrementDailyTracker = async (accountId, groupId) => {
   const today = getTodayDate();
+  const now = new Date().toISOString();
   
   try {
+    // Use atomic MongoDB operations to avoid version conflicts
     const account = await Account.findById(accountId);
     if (!account) {
       console.error(`Account ${accountId} not found`);
       return false;
     }
 
-    const group = account.groups.find(g => g.id === groupId);
-    if (!group) {
+    const groupIndex = account.groups.findIndex(g => g.id === groupId);
+    if (groupIndex === -1) {
       console.error(`Group ${groupId} not found`);
       return false;
     }
 
-    if (!group.dailyTracker) {
-      group.dailyTracker = [];
-    }
-
-    let todayTracker = group.dailyTracker.find(t => t.date === today);
-
-    if (!todayTracker) {
-      todayTracker = { 
-        date: today, 
-        messageCount: 0,
-        lastSentAt: null
+    // Find existing tracker or create new one atomically
+    const group = account.groups[groupIndex];
+    const existingTracker = group.dailyTracker?.find(t => t.date === today);
+    
+    if (existingTracker) {
+      // Update existing tracker atomically
+      await Account.updateOne(
+        { _id: accountId, [`groups.${groupIndex}.dailyTracker.date`]: today },
+        {
+          $inc: { [`groups.${groupIndex}.dailyTracker.$.messageCount`]: 1 },
+          $set: { [`groups.${groupIndex}.dailyTracker.$.lastSentAt`]: now }
+        }
+      );
+    } else {
+      // Create new tracker atomically
+      const newTracker = {
+        date: today,
+        messageCount: 1,
+        lastSentAt: now
       };
-      group.dailyTracker.push(todayTracker);
+      
+      await Account.updateOne(
+        { _id: accountId },
+        {
+          $push: {
+            [`groups.${groupIndex}.dailyTracker`]: newTracker
+          }
+        }
+      );
     }
-
-    todayTracker.messageCount += 1;
-    todayTracker.lastSentAt = new Date().toISOString();
-
-    await account.save();
     
     return true;
   } catch (error) {
     console.error(`Error updating tracker:`, error);
-    return false;
+    // Fallback: retry with fresh document read
+    try {
+      const account = await Account.findById(accountId);
+      if (!account) return false;
+      
+      const group = account.groups.find(g => g.id === groupId);
+      if (!group) return false;
+      
+      if (!group.dailyTracker) {
+        group.dailyTracker = [];
+      }
+      
+      let todayTracker = group.dailyTracker.find(t => t.date === today);
+      if (!todayTracker) {
+        todayTracker = { 
+          date: today, 
+          messageCount: 0,
+          lastSentAt: null
+        };
+        group.dailyTracker.push(todayTracker);
+      }
+      
+      todayTracker.messageCount += 1;
+      todayTracker.lastSentAt = now;
+      
+      // Use updateOne instead of save to avoid version conflicts
+      await Account.updateOne(
+        { _id: accountId },
+        { $set: { groups: account.groups } }
+      );
+      
+      return true;
+    } catch (retryError) {
+      console.error(`Retry failed:`, retryError);
+      return false;
+    }
   }
 };
 
@@ -479,9 +527,20 @@ const getNextMessageWithLocalId = (localMessageId) => {
   const totalMessages = Object.keys(devMessages).length;
   const nextId = localMessageId >= totalMessages - 1 ? 0 : localMessageId + 1;
   
+  const messageText = devMessages[nextId];
+  
+  if (!messageText) {
+    console.error(`  ❌ Message ID ${nextId} not found! Total messages: ${totalMessages}, localMessageId: ${localMessageId}`);
+    // Fallback to first message if current one doesn't exist
+    return {
+      id: 1,
+      text: devMessages[1] || "Hey! Developer available for projects. DM me if you need help!"
+    };
+  }
+  
   return {
     id: nextId,
-    text: devMessages[nextId]
+    text: messageText
   };
 };
 
@@ -669,27 +728,32 @@ const processAccount = async (account) => {
       const today = getTodayDate();
       const todayTracker = group.dailyTracker?.find(t => t.date === today);
       
-      // If no tracker exists for today, send immediately (first message of the day)
-      if (!todayTracker || !todayTracker.lastSentAt) {
+      // If no tracker exists for today OR tracker exists but no messages sent (messageCount is 0 or null), send immediately
+      if (!todayTracker || !todayTracker.lastSentAt || (todayTracker.messageCount === 0 || todayTracker.messageCount == null)) {
         console.log(`  ✅ [${account.number}] ${group.name} is ready to send (first message today)`);
       } else {
-        // Check interval only if we've already sent messages today
-        const requiredInterval = calculateMessageInterval(group);
-        
-        if (requiredInterval === null) {
-          console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - interval calculation returned null`);
-          continue;
+        // Check interval only if we've already sent messages today AND messageCount > 0
+        // If messageCount is 0, treat it as no messages sent
+        if (todayTracker.messageCount === 0 || todayTracker.messageCount == null) {
+          console.log(`  ✅ [${account.number}] ${group.name} is ready to send (tracker exists but no messages sent)`);
+        } else {
+          const requiredInterval = calculateMessageInterval(group);
+          
+          if (requiredInterval === null) {
+            console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - interval calculation returned null`);
+            continue;
+          }
+          
+          const timeSinceLastSend = Date.now() - new Date(todayTracker.lastSentAt).getTime();
+          
+          if (timeSinceLastSend < requiredInterval) {
+            const waitMinutes = Math.ceil((requiredInterval - timeSinceLastSend) / (1000 * 60));
+            console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - need to wait ${waitMinutes} more minutes`);
+            continue;
+          }
+          
+          console.log(`  ✅ [${account.number}] ${group.name} is ready to send (interval: ${Math.ceil(requiredInterval / (1000 * 60))} min)`);
         }
-        
-        const timeSinceLastSend = Date.now() - new Date(todayTracker.lastSentAt).getTime();
-        
-        if (timeSinceLastSend < requiredInterval) {
-          const waitMinutes = Math.ceil((requiredInterval - timeSinceLastSend) / (1000 * 60));
-          console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - need to wait ${waitMinutes} more minutes`);
-          continue;
-        }
-        
-        console.log(`  ✅ [${account.number}] ${group.name} is ready to send (interval: ${Math.ceil(requiredInterval / (1000 * 60))} min)`);
       }
       
       const catchUpResult = await handleCatchUp(group, account, localMessageId);
@@ -701,6 +765,18 @@ const processAccount = async (account) => {
       await updateDailyTracker(account._id, group.id);
       
       const nextMessage = getNextMessageWithLocalId(localMessageId);
+      
+      // Validate message before sending
+      if (!nextMessage.text || nextMessage.text.trim() === '') {
+        console.error(`  ❌ [${account.number}] Message is empty for ${group.name}! Message ID: ${nextMessage.id}, localMessageId: ${localMessageId}`);
+        // Skip this group and increment message ID to try next one
+        localMessageId = catchUpResult.newLocalMessageId;
+        await Account.updateOne(
+          { _id: account._id },
+          { $inc: { currentMessageId: 1 } }
+        );
+        continue;
+      }
       
       console.log(`  📤 ${group.name} (${todayTracker ? todayTracker.messageCount + 1 : 1}/${group.msgPerDay})`);
       

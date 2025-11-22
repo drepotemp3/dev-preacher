@@ -218,9 +218,19 @@ ${content}`;
     console.log(`✅ Monitoring started for account: ${accountUsername}`);
 
   } catch (error) {
+    const errorMsg = error?.errorMessage || error?.message || '';
+    const errorCode = error?.code;
+    
+    // Handle AUTH_KEY_DUPLICATED - session is being used elsewhere
+    if (errorCode === 406 || errorMsg.includes('AUTH_KEY_DUPLICATED')) {
+      console.warn(`⚠️  Account ${account.number}: Session is being used by another client (preaching system). Monitoring will be skipped for this account.`);
+      console.warn(`   This is normal when the preaching system is active. Monitoring will resume when preaching stops.`);
+      return; // Don't retry - this account is being used for preaching
+    }
+    
     console.error(`❌ Error starting monitoring for account ${account.number}:`, error);
     
-    // Retry after delay if initial connection fails
+    // Retry after delay if initial connection fails (but not for AUTH_KEY_DUPLICATED)
     setTimeout(() => {
       console.log(`🔄 Retrying monitoring for ${account.number}...`);
       startMonitoringAccount(account);
