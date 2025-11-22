@@ -243,16 +243,16 @@ const calculateMissedMessages = (group) => {
 };
 
 // Handle catch-up for groups that missed multiple messages
-const handleCatchUp = async (group, account, localMessageId) => {
+const handleCatchUp = async (group, account, lastUsedMessageId) => {
   const missedMessages = calculateMissedMessages(group);
   
   if (missedMessages <= 1) {
-    return { shouldSend: true, newLocalMessageId: localMessageId + 1 };
+    return { shouldSend: true, catchUpMode: false };
   }
   
   console.log(`  🔄 Catch-up: ${group.name} (${missedMessages} messages behind)`);
   
-  return { shouldSend: true, newLocalMessageId: localMessageId + 1, catchUpMode: true };
+  return { shouldSend: true, catchUpMode: true };
 };
 
 // Create Telegram client with fingerprinting
@@ -522,17 +522,30 @@ const hasReachedDailyLimit = (group) => {
   return todayTracker.messageCount >= group.msgPerDay;
 };
 
-// Get next message using local message ID counter
-const getNextMessageWithLocalId = (localMessageId) => {
+// Get a random message ID that is different from the last one used
+const getRandomMessageId = (lastUsedId) => {
   const totalMessages = Object.keys(devMessages).length;
-  // Wrap around: messages are 1-50, so use modulo to cycle from 1 to 50
-  // If localMessageId is 0, next is 1. If 50, next is 1. If 164, next is (164 % 50) + 1 = 15
-  const nextId = ((localMessageId) % totalMessages) + 1;
   
-  const messageText = devMessages[nextId];
+  // If there's only one message, return it
+  if (totalMessages === 1) {
+    return 1;
+  }
+  
+  // Generate a random ID between 1 and totalMessages
+  let randomId;
+  do {
+    randomId = Math.floor(Math.random() * totalMessages) + 1;
+  } while (randomId === lastUsedId && totalMessages > 1); // Ensure it's different from last used
+  
+  return randomId;
+};
+
+// Get message by ID
+const getMessageById = (messageId) => {
+  const messageText = devMessages[messageId];
   
   if (!messageText) {
-    // This should never happen, but fallback just in case
+    // Fallback to first message if ID is invalid
     return {
       id: 1,
       text: devMessages[1] || "Hey! Developer available for projects. DM me if you need help!"
@@ -540,7 +553,7 @@ const getNextMessageWithLocalId = (localMessageId) => {
   }
   
   return {
-    id: nextId,
+    id: messageId,
     text: messageText
   };
 };
@@ -724,7 +737,7 @@ const processAccount = async (account) => {
     }
     
     let messagesSent = 0;
-    let localMessageId = account.currentMessageId || 0;
+    let lastUsedMessageId = account.currentMessageId || 0;
     
     for (const group of account.groups) {
       if (!preachingActive || preachingController?.signal.aborted) {
@@ -756,22 +769,25 @@ const processAccount = async (account) => {
         }
       }
       
-      const catchUpResult = await handleCatchUp(group, account, localMessageId);
+      const catchUpResult = await handleCatchUp(group, account, lastUsedMessageId);
       if (!catchUpResult.shouldSend) {
         continue;
       }
       
       await updateDailyTracker(account._id, group.id);
       
-      const nextMessage = getNextMessageWithLocalId(localMessageId);
+      // Get a random message ID that's different from the last one used
+      const selectedMessageId = getRandomMessageId(lastUsedMessageId);
+      const nextMessage = getMessageById(selectedMessageId);
       
       // Validate message before sending
       if (!nextMessage.text || nextMessage.text.trim() === '') {
         console.error(`  ❌ [${accountUsername}] Empty message for ${group.name} (ID: ${nextMessage.id})`);
-        localMessageId = catchUpResult.newLocalMessageId;
+        // Select a new random message ID and update
+        lastUsedMessageId = getRandomMessageId(lastUsedMessageId);
         await Account.updateOne(
           { _id: account._id },
-          { $inc: { currentMessageId: 1 } }
+          { $set: { currentMessageId: lastUsedMessageId } }
         );
         continue;
       }
@@ -781,10 +797,11 @@ const processAccount = async (account) => {
       const activityCheck = await checkGroupActivity(client, group, accountUsername, entityCache);
       
       if (!activityCheck.hasActivity) {
-        localMessageId = catchUpResult.newLocalMessageId;
+        // Update currentMessageId even when skipping (to avoid repeating)
+        lastUsedMessageId = selectedMessageId;
         await Account.updateOne(
           { _id: account._id },
-          { $inc: { currentMessageId: 1 } }
+          { $set: { currentMessageId: lastUsedMessageId } }
         );
         await incrementDailyTracker(account._id, group.id);
         console.log(`  ⏭️  ${group.name} - ${activityCheck.reason}`);
@@ -796,10 +813,11 @@ const processAccount = async (account) => {
       const result = await sendMessageToGroup(client, group, nextMessage.text, accountUsername, account.number, entityCache);
       
       if (result?.success) {
-        localMessageId = catchUpResult.newLocalMessageId;
+        // Update currentMessageId with the randomly selected message ID
+        lastUsedMessageId = selectedMessageId;
         await Account.updateOne(
           { _id: account._id },
-          { $inc: { currentMessageId: 1 } }
+          { $set: { currentMessageId: lastUsedMessageId } }
         );
         await incrementDailyTracker(account._id, group.id);
         messagesSent++;
@@ -821,19 +839,21 @@ const processAccount = async (account) => {
         console.log(`  ⏸️  ${group.name} - flood wait`);
         await sleep(2000);
       } else if (result?.otherError) {
-        localMessageId = catchUpResult.newLocalMessageId;
+        // Update currentMessageId even on error (to avoid repeating)
+        lastUsedMessageId = selectedMessageId;
         await Account.updateOne(
           { _id: account._id },
-          { $inc: { currentMessageId: 1 } }
+          { $set: { currentMessageId: lastUsedMessageId } }
         );
         await incrementDailyTracker(account._id, group.id);
         const delay = getRandomDelay();
         await sleep(delay);
       } else {
-        localMessageId = catchUpResult.newLocalMessageId;
+        // Update currentMessageId even on unknown error
+        lastUsedMessageId = selectedMessageId;
         await Account.updateOne(
           { _id: account._id },
-          { $inc: { currentMessageId: 1 } }
+          { $set: { currentMessageId: lastUsedMessageId } }
         );
         await incrementDailyTracker(account._id, group.id);
         await sleep(2000);
