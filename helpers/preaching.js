@@ -525,13 +525,14 @@ const hasReachedDailyLimit = (group) => {
 // Get next message using local message ID counter
 const getNextMessageWithLocalId = (localMessageId) => {
   const totalMessages = Object.keys(devMessages).length;
-  const nextId = localMessageId >= totalMessages - 1 ? 0 : localMessageId + 1;
+  // Wrap around: messages are 1-50, so use modulo to cycle from 1 to 50
+  // If localMessageId is 0, next is 1. If 50, next is 1. If 164, next is (164 % 50) + 1 = 15
+  const nextId = ((localMessageId) % totalMessages) + 1;
   
   const messageText = devMessages[nextId];
   
   if (!messageText) {
-    console.error(`  ❌ Message ID ${nextId} not found! Total messages: ${totalMessages}, localMessageId: ${localMessageId}`);
-    // Fallback to first message if current one doesn't exist
+    // This should never happen, but fallback just in case
     return {
       id: 1,
       text: devMessages[1] || "Hey! Developer available for projects. DM me if you need help!"
@@ -568,7 +569,6 @@ const getNextEarliestReadyTime = async () => {
         
         // If no tracker for today OR no lastSentAt, group is ready NOW
         if (!todayTracker || !todayTracker.lastSentAt) {
-          console.log(`  🔍 Found group ready to send: ${account.number}:${group.name} (no messages sent today)`);
           return { readyTime: 0, groupInfo: `${account.number}:${group.name}` };
         }
       }
@@ -713,15 +713,12 @@ const processAccount = async (account) => {
     let messagesSent = 0;
     let localMessageId = account.currentMessageId || 0;
     
-    console.log(`  🔍 [${account.number}] Processing ${account.groups.length} groups...`);
-    
     for (const group of account.groups) {
       if (!preachingActive || preachingController?.signal.aborted) {
         break;
       }
       
       if (hasReachedDailyLimit(group)) {
-        console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - daily limit reached`);
         continue;
       }
       
@@ -730,35 +727,24 @@ const processAccount = async (account) => {
       
       // If no tracker exists for today OR tracker exists but no messages sent (messageCount is 0 or null), send immediately
       if (!todayTracker || !todayTracker.lastSentAt || (todayTracker.messageCount === 0 || todayTracker.messageCount == null)) {
-        console.log(`  ✅ [${account.number}] ${group.name} is ready to send (first message today)`);
+        // Ready to send - continue
       } else {
         // Check interval only if we've already sent messages today AND messageCount > 0
-        // If messageCount is 0, treat it as no messages sent
-        if (todayTracker.messageCount === 0 || todayTracker.messageCount == null) {
-          console.log(`  ✅ [${account.number}] ${group.name} is ready to send (tracker exists but no messages sent)`);
-        } else {
-          const requiredInterval = calculateMessageInterval(group);
-          
-          if (requiredInterval === null) {
-            console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - interval calculation returned null`);
-            continue;
-          }
-          
-          const timeSinceLastSend = Date.now() - new Date(todayTracker.lastSentAt).getTime();
-          
-          if (timeSinceLastSend < requiredInterval) {
-            const waitMinutes = Math.ceil((requiredInterval - timeSinceLastSend) / (1000 * 60));
-            console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - need to wait ${waitMinutes} more minutes`);
-            continue;
-          }
-          
-          console.log(`  ✅ [${account.number}] ${group.name} is ready to send (interval: ${Math.ceil(requiredInterval / (1000 * 60))} min)`);
+        const requiredInterval = calculateMessageInterval(group);
+        
+        if (requiredInterval === null) {
+          continue;
+        }
+        
+        const timeSinceLastSend = Date.now() - new Date(todayTracker.lastSentAt).getTime();
+        
+        if (timeSinceLastSend < requiredInterval) {
+          continue;
         }
       }
       
       const catchUpResult = await handleCatchUp(group, account, localMessageId);
       if (!catchUpResult.shouldSend) {
-        console.log(`  ⏭️  [${account.number}] Skipping ${group.name} - catchUp returned shouldSend: false`);
         continue;
       }
       
@@ -768,8 +754,7 @@ const processAccount = async (account) => {
       
       // Validate message before sending
       if (!nextMessage.text || nextMessage.text.trim() === '') {
-        console.error(`  ❌ [${account.number}] Message is empty for ${group.name}! Message ID: ${nextMessage.id}, localMessageId: ${localMessageId}`);
-        // Skip this group and increment message ID to try next one
+        console.error(`  ❌ [${account.number}] Empty message for ${group.name} (ID: ${nextMessage.id})`);
         localMessageId = catchUpResult.newLocalMessageId;
         await Account.updateOne(
           { _id: account._id },
@@ -783,43 +768,29 @@ const processAccount = async (account) => {
       const activityCheck = await checkGroupActivity(client, group, account.number, entityCache);
       
       if (!activityCheck.hasActivity) {
-        console.log(`  ⏭️  Skipping ${group.name} - ${activityCheck.reason}`);
-        
         localMessageId = catchUpResult.newLocalMessageId;
-        
         await Account.updateOne(
           { _id: account._id },
           { $inc: { currentMessageId: 1 } }
         );
-        
         await incrementDailyTracker(account._id, group.id);
-        
-        console.log(`  ✅ Marked as sent (skipped due to low activity)`);
-        
+        console.log(`  ⏭️  ${group.name} - ${activityCheck.reason}`);
         const delay = getRandomDelay();
         await sleep(delay);
         continue;
       }
       
-      console.log(`  🚀 Attempting to send message to ${group.name}...`);
       const result = await sendMessageToGroup(client, group, nextMessage.text, account.number, entityCache);
       
       if (result?.success) {
         localMessageId = catchUpResult.newLocalMessageId;
-        
         await Account.updateOne(
           { _id: account._id },
           { $inc: { currentMessageId: 1 } }
         );
-        
-        const trackerUpdateSuccess = await incrementDailyTracker(account._id, group.id);
-        
-        if (!trackerUpdateSuccess) {
-          console.error(`  ❌ Failed to update tracker for ${group.name}`);
-        }
-        
+        await incrementDailyTracker(account._id, group.id);
         messagesSent++;
-        console.log(`  ✅ Successfully sent message to ${group.name}`);
+        console.log(`  ✅ ${group.name}`);
         
         if (catchUpResult.catchUpMode) {
           const catchUpDelay = 30000 + Math.random() * 30000;
@@ -832,26 +803,20 @@ const processAccount = async (account) => {
         console.log(`  🚨 Critical error - stopping account`);
         break;
       } else if (result?.skipGroup) {
-        console.log(`  ⏭️  Skipping ${group.name} due to group error`);
         continue;
       } else if (result?.floodWait) {
-        console.log(`  ⏸️  Flood wait for ${group.name} - will retry later`);
+        console.log(`  ⏸️  ${group.name} - flood wait`);
         await sleep(2000);
       } else if (result?.otherError) {
-        console.log(`  ⚠️  Other error for ${group.name} - marking as sent and continuing`);
         localMessageId = catchUpResult.newLocalMessageId;
-        
         await Account.updateOne(
           { _id: account._id },
           { $inc: { currentMessageId: 1 } }
         );
-        
         await incrementDailyTracker(account._id, group.id);
-        
         const delay = getRandomDelay();
         await sleep(delay);
       } else {
-        console.error(`  ❌ Unknown error sending to ${group.name} - result:`, result);
         localMessageId = catchUpResult.newLocalMessageId;
         await Account.updateOne(
           { _id: account._id },
@@ -862,10 +827,8 @@ const processAccount = async (account) => {
       }
     }
     
-    if (messagesSent > 0) {
-      console.log(`  ✅ ${account.number}: ${messagesSent} messages sent`);
-    } else {
-      // Check if there are groups that should have sent but didn't
+    if (messagesSent === 0) {
+      // Only log if no messages were sent and groups need messages
       const today = getTodayDate();
       let groupsNeedingMessages = 0;
       for (const group of account.groups) {
@@ -875,11 +838,8 @@ const processAccount = async (account) => {
           groupsNeedingMessages++;
         }
       }
-      
       if (groupsNeedingMessages > 0) {
-        console.log(`  ⚠️  ${account.number}: No messages sent but ${groupsNeedingMessages} groups need messages today!`);
-      } else {
-        console.log(`  ℹ️  ${account.number}: No messages sent this cycle`);
+        console.log(`  ⚠️  ${account.number}: ${groupsNeedingMessages} groups need messages`);
       }
     }
     
