@@ -187,6 +187,7 @@ const getRemainingHoursToday = () => {
 };
 
 // Calculate interval between messages for a group
+// Split 24 hours evenly by msgPerDay (default 5 = 4.8 hours per message)
 const calculateMessageInterval = (group) => {
   const today = getTodayDate();
   // Only consider today's tracker - ignore old trackers from previous days
@@ -199,20 +200,9 @@ const calculateMessageInterval = (group) => {
     return null;
   }
   
-  const remainingHours = getRemainingHoursToday();
-  let intervalHours = remainingHours / messagesRemaining;
-  
-  // If there's very little time left, allow sending immediately (minimum 0.1 hours = 6 minutes)
-  if (intervalHours < 0.1) {
-    intervalHours = 0.1;
-  } else if (intervalHours < 1) {
-    intervalHours = 1;
-  }
-  
-  if (intervalHours > 6) {
-    intervalHours = 6;
-  }
-  
+  // Split 24 hours evenly by msgPerDay
+  // If msgPerDay is 5, each interval is 24/5 = 4.8 hours
+  const intervalHours = 24 / group.msgPerDay;
   const intervalMs = intervalHours * 60 * 60 * 1000;
   
   return intervalMs;
@@ -638,6 +628,7 @@ const getNextEarliestReadyTime = async () => {
 };
 
 // Check if group has sufficient activity
+// Only send if the last 8 messages don't include our messages (to avoid spam)
 const checkGroupActivity = async (client, group, accountUsername, entityCache) => {
   try {
     const me = await client.getMe();
@@ -645,7 +636,7 @@ const checkGroupActivity = async (client, group, accountUsername, entityCache) =
 
     try {
       const entity = await resolveGroupEntity(client, group, entityCache);
-      const messages = await client.getMessages(entity, { limit: 5 });
+      const messages = await client.getMessages(entity, { limit: 8 });
       
       if (!messages || messages.length === 0) {
         return { hasActivity: true };
@@ -657,7 +648,7 @@ const checkGroupActivity = async (client, group, accountUsername, entityCache) =
       });
 
       if (hasOurMessage) {
-        return { hasActivity: false, reason: 'Message still in recent 5' };
+        return { hasActivity: false, reason: 'Our message still in recent 8' };
       }
 
       return { hasActivity: true };
