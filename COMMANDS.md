@@ -27,6 +27,9 @@ This document lists all commands available in **dev-preacher**, what they do, an
 - **Why**: Enables the “finder” feature (keyword detection) to forward matching messages into the dump group.
 - **Notes**:
   - If no dump group is set, finder forwarding is disabled (messages are ignored).
+  - Only works when the sender is recognized as admin via:
+    - `Account` with `admin:true` and `adminUserId === ctx.from.id`
+    - or `AdminWithoutSessions` with `userId === ctx.from.id`
 
 ### `/set_admin {username | userId}`
 - **Access**: Admin
@@ -34,6 +37,11 @@ This document lists all commands available in **dev-preacher**, what they do, an
   - If `{username}` matches an existing `Account.username`, sets that account’s `admin` to `true` (and stores `adminUserId` if resolvable).
   - Otherwise, stores the admin in `adminWithoutSessions` (requires a resolvable/provided `userId`).
 - **Why**: Removes hardcoded admin credentials and allows multiple admins.
+
+### `/whoami`
+- **Access**: Anyone
+- **What it does**: Shows your Telegram numeric `id` and your `username` (if set).
+- **Why**: Helps you know what to pass into `/set_admin` or to debug admin detection.
 
 ## Menu Actions (Buttons)
 

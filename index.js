@@ -30,8 +30,11 @@ global.bot = bot;
 async function isAdminUserId(userId) {
   const id = userId?.toString();
   if (!id) return false;
+
+  // Auth strictly via DB: admin Accounts or AdminWithoutSessions
   const accountAdmin = await Account.findOne({ admin: true, adminUserId: id });
   if (accountAdmin) return true;
+
   const adminNoSession = await AdminWithoutSessions.findOne({ userId: id });
   return !!adminNoSession;
 }
@@ -105,9 +108,20 @@ bot.on("text", async (ctx) => {
   }
 });
 
-bot.telegram.setMyCommands([{command:"/start", description:"Start the bot"}])
+bot.telegram.setMyCommands([
+  {command:"/start", description:"Start the bot"},
+  {command:"/groupId", description:"Show current group id (use in group)"},
+  {command:"/set_dump", description:"Set dump group (admin only)"},
+  {command:"/set_admin", description:"Register a bot admin (admin only)"},
+  {command:"/whoami", description:"Show your Telegram id and username"}
+])
 
 // Admin commands
+bot.command("whoami", async (ctx) => {
+  const id = ctx.from.id.toString();
+  const username = ctx.from.username ? `@${ctx.from.username}` : 'none';
+  await ctx.reply(`id: ${id}\nusername: ${username}`);
+});
 bot.command("groupId", async (ctx) => {
   // Only meaningful in groups/supergroups/channels
   const chatType = ctx.chat?.type;
