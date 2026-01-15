@@ -360,71 +360,13 @@ const handleAccountError = async (error, accountNumber) => {
   return { isOtherError: true };
 };
 
-// Clean up old daily tracker entries (keep only today's and yesterday's for safety)
-const cleanupOldTrackers = async (accountId, groupId) => {
-  const today = getTodayDate();
-  const yesterday = new Date();
-  yesterday.setDate(yesterday.getDate() - 1);
-  const yesterdayStr = yesterday.toISOString().split('T')[0];
-  
-  try {
-    const account = await Account.findById(accountId);
-    if (!account) return false;
-
-    const group = account.groups.find(g => g.id === groupId);
-    if (!group) return false;
-
-    if (!group.dailyTracker || group.dailyTracker.length === 0) {
-      return true;
-    }
-
-    // Keep only today's and yesterday's trackers
-    group.dailyTracker = group.dailyTracker.filter(
-      t => t.date === today || t.date === yesterdayStr
-    );
-
-    await account.save();
-    return true;
-  } catch (error) {
-    console.error(`Error cleaning up trackers:`, error);
-    return false;
-  }
-};
-
 // Update daily tracker for a group
 const updateDailyTracker = async (accountId, groupId) => {
-  const today = getTodayDate();
-  
-  try {
-    const account = await Account.findById(accountId);
-    if (!account) return false;
-
-    const group = account.groups.find(g => g.id === groupId);
-    if (!group) return false;
-
-    // Clean up old trackers first
-    await cleanupOldTrackers(accountId, groupId);
-
-    if (!group.dailyTracker) {
-      group.dailyTracker = [];
-    }
-
-    let todayTracker = group.dailyTracker.find(t => t.date === today);
-
-    if (!todayTracker) {
-      group.dailyTracker.push({ 
-        date: today, 
-        messageCount: 0,
-        lastSentAt: null
-      });
-    }
-
-    await account.save();
-    return true;
-  } catch (error) {
-    console.error(`Error updating daily tracker:`, error);
-    return false;
-  }
+  // This function previously read & saved the Account document and could cause VersionError
+  // when other parts of the code were updating the same document concurrently.
+  // The actual tracker updates are handled in incrementDailyTracker using atomic updates.
+  // To avoid version conflicts, this function is now a no-op that always succeeds.
+  return true;
 };
 
 // Update daily tracker after successful message send (using atomic update to avoid version conflicts)
