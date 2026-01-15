@@ -110,23 +110,38 @@ bot.command("groupid", async (ctx) => {
   return ctx.reply(chatId ? `Group ID: ${chatId}` : "Could not read group id.");
 });
 
-bot.command("set_dump", async (ctx) => {
-  if (!(await isAdminUserId(ctx.from.id))) {
-    return ctx.reply("Not allowed.");
-  }
 
+// Add this function at the top
+function ensureMinus100(groupId) {
+  const idStr = groupId.toString().trim().replace(/\s+/g, '');
+  
+  // If already starts with -100, return as is
+  if (idStr.startsWith('-100')) return idStr;
+  
+  // Remove any existing minus sign
+  const cleanId = idStr.replace(/^-/, '');
+  
+  // Always prepend -100 for storage
+  return `-100${cleanId}`;
+}
+
+// Update your set_dump command
+bot.command("set_dump", async (ctx) => {
+  if (!(await isAdminUserId(ctx.from.id))) return ctx.reply("Not allowed.");
+  
   const parts = (ctx.message.text || "").trim().split(/\s+/);
   const groupId = parts[1];
-  if (!groupId) {
-    return ctx.reply("Usage: /set_dump {groupId}");
-  }
-
+  if (!groupId) return ctx.reply("Usage: /set_dump {groupId}");
+  
+  const normalizedId = ensureMinus100(groupId);
+  
   const doc = await ensureSystemDoc();
-  doc.dumpGroupId = groupId.toString();
+  doc.dumpGroupId = normalizedId;
   await doc.save();
-
-  await ctx.reply(`✅ Dump group set to: ${groupId}`);
+  
+  await ctx.reply(`✅ Dump group set to: ${normalizedId}`);
 });
+
 
 bot.command("set_admin", async (ctx) => {
   if (!(await isAdminUserId(ctx.from.id))) {
