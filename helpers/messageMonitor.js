@@ -29,8 +29,8 @@ function createMonitoringClient(session) {
 // Send notification to admin
 const truncate50 = (text = '') => {
   const cleaned = (text || '').toString().replace(/\s+/g, ' ').trim();
-  if (cleaned.length <= 50) return cleaned;
-  return `${cleaned.slice(0, 47)}...`;
+  if (cleaned.length <= 750) return cleaned;
+  return `${cleaned.slice(0, 747)}...`;
 };
 
 async function getAdminUserIds() {
@@ -290,7 +290,6 @@ async function startMonitoringAccount(account) {
             const groupName = chat?.title || 'Unknown Group';
             
             const dumpText =
-              `🔍 Keyword Detected!\n\n` +
               `From: ${username} | ID: ${userId}\n` +
               `Group: ${groupName}\n\n` +
               `Message: ${truncate50(content)}\n\n` +
