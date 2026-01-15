@@ -226,29 +226,45 @@ bot.command("set_admin", async (ctx) => {
 });
 
 // Finder messages "Completed" button
-bot.action(/^finder_done:(.+)$/, async (ctx) => {
-  if (!(await isAdminUserId(ctx.from.id))) {
-    return ctx.answerCbQuery("Not allowed");
-  }
-
-  const finderId = ctx.match[1];
-  const record = await FinderMessage.findById(finderId);
-  if (!record) {
-    await ctx.answerCbQuery("Already handled");
-    return;
-  }
-
+// Add this handler for the finder callback
+bot.action(/^finder_done:(.+)/, async (ctx) => {
   try {
-    await bot.telegram.deleteMessage(record.dumpGroupId, record.dumpMessageId);
-  } catch {
-    // ignore
+    const finderId = ctx.match[1];
+    
+    // Find the finder message
+    const finder = await FinderMessage.findById(finderId);
+    if (!finder) {
+      await ctx.answerCbQuery("Finder message not found");
+      return;
+    }
+
+    // Delete the message from dump group
+    try {
+      await ctx.deleteMessage();
+    } catch (deleteError) {
+      console.log("Could not delete message:", deleteError.message);
+      // Try to edit message instead if delete fails
+      await ctx.editMessageText(`✅ Completed\n\n${finder.preview}`, {
+        reply_markup: { inline_keyboard: [] }
+      });
+    }
+
+    // Update finder as completed
+    finder.completed = true;
+    finder.completedAt = new Date();
+    await finder.save();
+
+    await ctx.answerCbQuery("✅ Marked as completed");
+
+  } catch (error) {
+    console.error("Error handling finder done:", error);
+    await ctx.answerCbQuery("Error processing request");
   }
+});
 
-  await FinderMessage.deleteOne({ _id: finderId });
-
-  try {
-    await ctx.answerCbQuery("Completed");
-  } catch { }
+// For old messages with the "finder_done_pending" callback
+bot.action('finder_done_pending', async (ctx) => {
+  await ctx.answerCbQuery("This action has expired");
 });
 
 // Text message handler for multi-step conversations
