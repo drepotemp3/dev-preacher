@@ -54,7 +54,7 @@ app.get("/ping", (req, res) => {
 
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => {
-  console.log("Server is running on port ",PORT);
+  console.log("Server is running on port ", PORT);
 });
 
 bot.start(handleStart)
@@ -90,31 +90,8 @@ bot.action("add_account", handleAddAccount);
 bot.action("refresh_groups", handleRefreshGroups);
 bot.action("set_report_channel", handleSetReportChannel);
 
-// Text message handler for multi-step conversations
-bot.on("text", async (ctx) => {
-  const userId = ctx.from.id;
-  const session = getUserSession(userId);
 
-  if (!session) return;
 
-  if (session.step === "awaiting_number") {
-    await handlePhoneNumber(ctx, session);
-  } else if (session.step === "awaiting_code") {
-    await handleVerificationCode(ctx, session);
-  } else if (session.step === "awaiting_password") {
-    await handlePassword(ctx, session);
-  } else if (session.step === "awaiting_channel") {
-    await handleChannelUsername(ctx, session);
-  }
-});
-
-bot.telegram.setMyCommands([
-  {command:"/start", description:"Start the bot"},
-  {command:"/groupId", description:"Show current group id (use in group)"},
-  {command:"/set_dump", description:"Set dump group (admin only)"},
-  {command:"/set_admin", description:"Register a bot admin (admin only)"},
-  {command:"/whoami", description:"Show your Telegram id and username"}
-])
 
 // Admin commands
 bot.command("whoami", async (ctx) => {
@@ -122,7 +99,7 @@ bot.command("whoami", async (ctx) => {
   const username = ctx.from.username ? `@${ctx.from.username}` : 'none';
   await ctx.reply(`id: ${id}\nusername: ${username}`);
 });
-bot.command("groupId", async (ctx) => {
+bot.command("groupid", async (ctx) => {
   // Only meaningful in groups/supergroups/channels
   const chatType = ctx.chat?.type;
   if (!chatType || (chatType !== "group" && chatType !== "supergroup" && chatType !== "channel")) {
@@ -241,7 +218,25 @@ bot.action(/^finder_done:(.+)$/, async (ctx) => {
 
   try {
     await ctx.answerCbQuery("Completed");
-  } catch {}
+  } catch { }
+});
+
+// Text message handler for multi-step conversations
+bot.on("text", async (ctx) => {
+  const userId = ctx.from.id;
+  const session = getUserSession(userId);
+
+  if (!session) return;
+
+  if (session.step === "awaiting_number") {
+    await handlePhoneNumber(ctx, session);
+  } else if (session.step === "awaiting_code") {
+    await handleVerificationCode(ctx, session);
+  } else if (session.step === "awaiting_password") {
+    await handlePassword(ctx, session);
+  } else if (session.step === "awaiting_channel") {
+    await handleChannelUsername(ctx, session);
+  }
 });
 // ============================================
 // Initialize Bot
@@ -253,10 +248,19 @@ async function main() {
 
     // Launch bot
     launchBot(bot);
-    
+
+    bot.telegram.setMyCommands([
+      { command: "start", description: "Start the bot" },
+      { command: "groupid", description: "Show current group id (use in group)" },
+      { command: "set_dump", description: "Set dump group (admin only)" },
+      { command: "set_admin", description: "Register a bot admin (admin only)" },
+      { command: "whoami", description: "Show your Telegram id and username" }
+    ])
+
+
     // Start message monitoring for DMs and replies
     await startMessageMonitoring();
-    
+
     // Start preaching functionality
     startPreaching();
 
