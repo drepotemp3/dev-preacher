@@ -365,7 +365,7 @@ export async function fetchAccountGroups(session) {
           id: entity.id.toString(),
           name: entity.title || 'Unnamed Group',
           link: entity.username ? `https://t.me/${entity.username}` : null,
-          msgPerDay: 3,
+          msgPerDay: 5,
           lastMessageId: 0
         });
       }
@@ -378,6 +378,66 @@ export async function fetchAccountGroups(session) {
     console.error('Error fetching groups:', error);
     await client.disconnect();
     return null;
+  }
+}
+
+const extractUsernameFromLink = (link = '') => {
+  if (!link) return null;
+  let normalized = link.trim();
+  normalized = normalized.replace(/^https?:\/\//i, '');
+  normalized = normalized.replace(/^t\.me\//i, '');
+  normalized = normalized.replace(/^telegram\.me\//i, '');
+  normalized = normalized.split('/')[0];
+  normalized = normalized.split('?')[0];
+  normalized = normalized.replace('@', '').trim();
+  return normalized || null;
+};
+
+const extractInviteHash = (link = '') => {
+  if (!link) return null;
+  // Examples: https://t.me/+HASH , https://t.me/joinchat/HASH
+  const m1 = link.match(/t\.me\/\+([a-zA-Z0-9_-]+)/);
+  if (m1?.[1]) return m1[1];
+  const m2 = link.match(/t\.me\/joinchat\/([a-zA-Z0-9_-]+)/);
+  if (m2?.[1]) return m2[1];
+  return null;
+};
+
+/**
+ * Join a group/channel by public username link or invite hash link.
+ */
+export async function joinGroup(session, linkOrUsername) {
+  const client = createClient(session);
+  try {
+    await client.connect();
+
+    const inviteHash = extractInviteHash(linkOrUsername);
+    if (inviteHash) {
+      await client.invoke(
+        new Api.messages.ImportChatInvite({
+          hash: inviteHash,
+        })
+      );
+      await client.disconnect();
+      return true;
+    }
+
+    const username = extractUsernameFromLink(linkOrUsername) || (linkOrUsername || '').replace('@', '').trim();
+    if (!username) {
+      await client.disconnect();
+      return false;
+    }
+
+    const entity = await client.getEntity(username);
+    // Works for channels/supergroups
+    await client.invoke(new Api.channels.JoinChannel({ channel: entity }));
+
+    await client.disconnect();
+    return true;
+  } catch (error) {
+    try { await client.disconnect(); } catch {}
+    console.error('Error joining group:', error?.message || error);
+    return false;
   }
 }
 

@@ -1,7 +1,7 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { NewMessage } from 'telegram/events/index.js';
-import { Account, Customer } from '../models/db.js';
+import { Account, AdminWithoutSessions, Customer, FinderMessage, System } from '../models/db.js';
 
 // Global storage for active monitoring clients
 let monitoringClients = new Map();
@@ -27,15 +27,91 @@ function createMonitoringClient(session) {
 }
 
 // Send notification to admin
-async function notifyAdmin(message) {
+const truncate50 = (text = '') => {
+  const cleaned = (text || '').toString().replace(/\s+/g, ' ').trim();
+  if (cleaned.length <= 50) return cleaned;
+  return `${cleaned.slice(0, 47)}...`;
+};
+
+async function getAdminUserIds() {
+  const userIds = new Set();
+
+  const adminAccounts = await Account.find({ admin: true, adminUserId: { $ne: null } }, { adminUserId: 1 });
+  for (const acc of adminAccounts) {
+    if (acc.adminUserId) userIds.add(acc.adminUserId.toString());
+  }
+
+  const adminsNoSessions = await AdminWithoutSessions.find({}, { userId: 1 });
+  for (const admin of adminsNoSessions) {
+    if (admin.userId) userIds.add(admin.userId.toString());
+  }
+
+  return Array.from(userIds);
+}
+
+async function notifyAdmins(message, extra = {}) {
   try {
-    if (global.bot && global.adminChatId) {
-      await global.bot.telegram.sendMessage(global.adminChatId, message);
-    }
+    if (!global.bot) return;
+
+    const adminUserIds = await getAdminUserIds();
+    if (adminUserIds.length === 0) return;
+
+    await Promise.allSettled(
+      adminUserIds.map((userId) =>
+        global.bot.telegram.sendMessage(userId, message, extra)
+      )
+    );
   } catch (error) {
     console.error('❌ Error sending admin notification:', error);
   }
 }
+
+const extractUsernameFromLink = (link = '') => {
+  if (!link) return null;
+  let normalized = link.trim();
+  normalized = normalized.replace(/^https?:\/\//i, '');
+  normalized = normalized.replace(/^t\.me\//i, '');
+  normalized = normalized.replace(/^telegram\.me\//i, '');
+  normalized = normalized.split('/')[0];
+  normalized = normalized.split('?')[0];
+  normalized = normalized.replace('@', '').trim();
+  return normalized || null;
+};
+
+const buildMessageLink = async (client, message) => {
+  try {
+    const chat = await message.getChat();
+    if (chat?.username) {
+      return `https://t.me/${chat.username}/${message.id}`;
+    }
+
+    const chatIdStr = (message.chatId || chat?.id)?.toString?.() || '';
+    if (chatIdStr.startsWith('-100')) {
+      return `https://t.me/c/${chatIdStr.slice(4)}/${message.id}`;
+    }
+    if (chatIdStr.startsWith('-')) {
+      return `https://t.me/c/${chatIdStr.slice(1)}/${message.id}`;
+    }
+    return '';
+  } catch {
+    return '';
+  }
+};
+
+async function getDumpGroupId() {
+  const doc = await System.findOne({}, { dumpGroupId: 1 });
+  return doc?.dumpGroupId || null;
+}
+
+const FINDING_KEYWORDS = [
+  'web', 'website', 'dev', 'developer', 'bot', 'software', 'engineer',
+  'programmer', 'build', 'develop', 'clone'
+];
+
+const containsFindingKeyword = (text = '') => {
+  const lower = (text || '').toLowerCase();
+  return FINDING_KEYWORDS.some((k) => lower.includes(k));
+};
 
 // Reconnect monitoring for a specific account
 async function reconnectMonitoring(account, accountUsername) {
@@ -130,64 +206,106 @@ async function startMonitoringAccount(account) {
               await customer.save();
 
               // Send notification to admin
-              const notificationMessage = `🔔 New DM to ${accountUsername}
-
-From: ${username} | ID: ${userId}
-
-Message:
-${content}`;
-
-              await notifyAdmin(notificationMessage);
-
-              // Auto-reply to the sender
-              try {
-                const replyMessage = `Hi, i will reply you from my main account ${global.adminUsername}. Please hold on`;
-                await client.sendMessage(sender, { message: replyMessage });
-              } catch (replyError) {
-                console.error('Error sending auto-reply:', replyError);
-              }
+              const notificationMessage = `🔔 New DM to ${accountUsername}\n\nFrom: ${username} | ID: ${userId}\n\nMessage: ${truncate50(content)}`;
+              await notifyAdmins(notificationMessage);
             }
             // If customer exists, ignore subsequent messages
             return;
           }
-          // Handle group messages - check if it's a reply to our message
-          else if (event.isGroup && message.replyTo && message.replyTo.replyToMsgId) {
-            // Get the message being replied to
-            const repliedToMsg = await client.getMessages(message.peerId, {
-              ids: [message.replyTo.replyToMsgId]
+
+          // Group replies to OUR message => notify admins (and store in Customer if new)
+          if (event.isGroup && message.replyTo && message.replyTo.replyToMsgId) {
+            try {
+              const chat = await message.getChat();
+              const repliedToMsg = await client.getMessages(message.peerId, { ids: [message.replyTo.replyToMsgId] });
+
+              if (repliedToMsg && repliedToMsg[0] && repliedToMsg[0].out) {
+                const existingCustomer = await Customer.findOne({ userId: userId });
+                if (!existingCustomer) {
+                  const customer = new Customer({
+                    username: username,
+                    userId: userId,
+                    textedAt: new Date(),
+                    type: 'reply',
+                    content: content,
+                    senderAccount: account.number,
+                    groupId: chat?.id?.toString?.() || null,
+                  });
+                  await customer.save();
+                }
+
+                const link = await buildMessageLink(client, message);
+                const groupName = chat?.title || 'Unknown Group';
+                const notificationMessage = `🔔 New reply to ${accountUsername}\n\nFrom: ${username} | ID: ${userId}\n\nGroup: ${groupName}\nLink: ${link}\n\nMessage: ${truncate50(content)}`;
+                await notifyAdmins(notificationMessage, { disable_web_page_preview: true });
+                return;
+              }
+            } catch (e) {
+              // ignore reply-check errors
+            }
+          }
+
+          // Finder mode: keyword detection across groups => forward to dump group (if configured)
+          if (event.isGroup && !event.isPrivate) {
+            const dumpGroupId = await getDumpGroupId();
+            if (!dumpGroupId) return;
+
+            if (!content || content === '[Media message]') return;
+            if (!containsFindingKeyword(content)) return;
+
+            // Only save if sender not in Customer collection already
+            const existingCustomer = await Customer.findOne({ userId: userId });
+            if (existingCustomer) return;
+
+            const link = await buildMessageLink(client, message);
+            if (!link) return;
+
+            // Save customer as finding-a-dev
+            const customer = new Customer({
+              username: username,
+              userId: userId,
+              textedAt: new Date(),
+              type: 'finding-a-dev',
+              content: truncate50(content),
+              senderAccount: account.number,
+              groupId: (message.chatId || '').toString?.() || null,
+            });
+            await customer.save();
+
+            // Send to dump group with button, store message ids
+            const dumpText =
+              `Message: ${truncate50(content)}\n\n` +
+              `Link: ${link}\n\n` +
+              `Completed`;
+
+            const sent = await global.bot.telegram.sendMessage(
+              dumpGroupId,
+              dumpText,
+              {
+                disable_web_page_preview: true,
+                reply_markup: {
+                  inline_keyboard: [[{ text: 'Completed', callback_data: 'finder_done_pending' }]],
+                },
+              }
+            );
+
+            // Store finder message in DB and then edit button callback to include id
+            const finder = await FinderMessage.create({
+              dumpGroupId: dumpGroupId.toString(),
+              dumpMessageId: sent.message_id,
+              sourceChatId: (message.chatId || '').toString(),
+              sourceMessageId: message.id,
+              sourceLink: link,
+              senderUserId: userId,
+              preview: truncate50(content),
             });
 
-            // Only notify if the reply is to our message
-            if (repliedToMsg && repliedToMsg[0] && repliedToMsg[0].out) {
-              const chat = await message.getChat();
-              const groupName = chat.title || 'Unknown Group';
-              const groupId = chat.id.toString();
-
-              // Create clickable link to the actual reply message
-              let messageLink;
-              if (chat.username) {
-                messageLink = `https://t.me/${chat.username}/${message.id}`;
-              } else {
-                // For private groups, use the group ID format
-                const cleanGroupId = groupId.replace('-100', '');
-                messageLink = `https://t.me/c/${cleanGroupId}/${message.id}`;
-              }
-
-              const notificationMessage = `🔔 New Reply to ${accountUsername}
-
-From: ${username} | ID: ${userId}
-
-Group: <a href="${messageLink}">${groupName}</a>
-
-Message:
-${content}`;
-
-              await global.bot.telegram.sendMessage(global.adminChatId, notificationMessage, {
-                parse_mode: 'HTML',
-                disable_web_page_preview: true,
-              });
-              return;
-            }
+            await global.bot.telegram.editMessageReplyMarkup(
+              dumpGroupId,
+              sent.message_id,
+              undefined,
+              { inline_keyboard: [[{ text: 'Completed', callback_data: `finder_done:${finder._id.toString()}` }]] }
+            );
           }
         } catch (error) {
           console.error(`Error processing message for ${accountUsername}:`, error);

@@ -1,7 +1,7 @@
 import { Markup } from 'telegraf';
-import { Account, System } from '../models/db.js';
+import { Account, AdminWithoutSessions, System } from '../models/db.js';
 import { loginAccount, createClient, sendCodeWithRetry, loginWith2FA } from './telegram.js';
-import { fetchAllAccountGroups, handleDuplicateGroups, findAdminOnlyGroups } from './groupManager.js';
+import { fetchAllAccountGroups, handleDuplicateGroups, findAdminOnlyGroups, syncAdminGroupsAndDistribute } from './groupManager.js';
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { Api } from 'telegram/tl/index.js';
@@ -11,6 +11,15 @@ const userSessions = new Map();
 
 // Global client storage for authentication
 let authClient = null;
+
+async function isAdminUserId(userId) {
+  const id = userId?.toString();
+  if (!id) return false;
+  const accountAdmin = await Account.findOne({ admin: true, adminUserId: id });
+  if (accountAdmin) return true;
+  const adminNoSession = await AdminWithoutSessions.findOne({ userId: id });
+  return !!adminNoSession;
+}
 
 export function getUserSession(userId) {
   return userSessions.get(userId);
@@ -101,15 +110,78 @@ export async function handleAllAccounts(ctx) {
 
 
 export async function handleAddAccount(ctx) {
+  // Only admins can login/add accounts
+  if (!(await isAdminUserId(ctx.from.id))) {
+    await ctx.answerCbQuery();
+    await ctx.reply('Not allowed.');
+    return;
+  }
+
   const userId = ctx.from.id;
   
   userSessions.set(userId, {
-    step: 'awaiting_number',
+    step: 'awaiting_account_type',
     data: {}
   });
   
   await ctx.editMessageText(
     '📱 *Add New Account*\n\n' +
+    'Should this account be an *admin* account or a normal (non-admin) account?\n\n' +
+    'Admin accounts are not used for preaching; they are used for managing groups and admin actions.',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('👑 Admin account', 'add_account_admin')],
+        [Markup.button.callback('👤 Non-admin account', 'add_account_nonadmin')],
+        [Markup.button.callback('« Cancel', 'back_to_main')]
+      ])
+    }
+  );
+  await ctx.answerCbQuery();
+}
+
+export async function handleAddAccountAdmin(ctx) {
+  if (!(await isAdminUserId(ctx.from.id))) {
+    await ctx.answerCbQuery();
+    await ctx.reply('Not allowed.');
+    return;
+  }
+
+  const userId = ctx.from.id;
+  const session = getUserSession(userId) || { step: 'awaiting_number', data: {} };
+  session.step = 'awaiting_number';
+  session.data = { ...(session.data || {}), isAdminAccount: true };
+  userSessions.set(userId, session);
+
+  await ctx.editMessageText(
+    '📱 *Add Admin Account*\n\n' +
+    'Please send the phone number (with country code):\n' +
+    'Example: +1234567890',
+    {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard([
+        [Markup.button.callback('« Cancel', 'back_to_main')]
+      ])
+    }
+  );
+  await ctx.answerCbQuery();
+}
+
+export async function handleAddAccountNonAdmin(ctx) {
+  if (!(await isAdminUserId(ctx.from.id))) {
+    await ctx.answerCbQuery();
+    await ctx.reply('Not allowed.');
+    return;
+  }
+
+  const userId = ctx.from.id;
+  const session = getUserSession(userId) || { step: 'awaiting_number', data: {} };
+  session.step = 'awaiting_number';
+  session.data = { ...(session.data || {}), isAdminAccount: false };
+  userSessions.set(userId, session);
+
+  await ctx.editMessageText(
+    '📱 *Add Non-admin Account*\n\n' +
     'Please send the phone number (with country code):\n' +
     'Example: +1234567890',
     {
@@ -123,6 +195,10 @@ export async function handleAddAccount(ctx) {
 }
 
 export async function handlePhoneNumber(ctx, session) {
+  if (!(await isAdminUserId(ctx.from.id))) {
+    clearUserSession(ctx.from.id);
+    return ctx.reply('Not allowed.');
+  }
   const phoneNumber = ctx.message.text.trim();
   
   await ctx.reply('⏳ Sending verification code...');
@@ -191,6 +267,10 @@ export async function handlePhoneNumber(ctx, session) {
 
 
 export async function handleVerificationCode(ctx, session) {
+  if (!(await isAdminUserId(ctx.from.id))) {
+    clearUserSession(ctx.from.id);
+    return ctx.reply('Not allowed.');
+  }
   const userId = ctx.from.id;
   const code = ctx.message.text.trim();
   const phoneNumber = session.data.phoneNumber;
@@ -251,6 +331,10 @@ export async function handleVerificationCode(ctx, session) {
 
 
 export async function handlePassword(ctx, session) {
+  if (!(await isAdminUserId(ctx.from.id))) {
+    clearUserSession(ctx.from.id);
+    return ctx.reply('Not allowed.');
+  }
   const userId = ctx.from.id;
   const password = ctx.message.text.trim();
   const phoneNumber = session.data.phoneNumber;
@@ -315,6 +399,9 @@ async function handleSuccessfulLogin(result, ctx, phoneNumber) {
   // Get user info
   const me = await authClient.getMe();
   const username = me.username;
+
+  const loginSession = getUserSession(userId);
+  const isAdminAccount = !!loginSession?.data?.isAdminAccount;
   
   // Fetch groups
   const dialogs = await authClient.getDialogs({ limit: 500 });
@@ -328,7 +415,7 @@ async function handleSuccessfulLogin(result, ctx, phoneNumber) {
         id: entity.id.toString(),
         name: entity.title || 'Unnamed Group',
         link: entity.username ? `https://t.me/${entity.username}` : null,
-        msgPerDay: 3,
+        msgPerDay: 5,
         lastMessageId: 0
       });
     }
@@ -343,7 +430,8 @@ async function handleSuccessfulLogin(result, ctx, phoneNumber) {
     username: username,
     session: sessionString,
     groups: groups,
-    admin: false,
+    admin: isAdminAccount,
+    ...(isAdminAccount ? { adminUserId: ctx.from.id.toString() } : {}),
     currentMessageId: 0 // Initialize account-level message ID
   });
   
@@ -382,17 +470,24 @@ export async function handleRefreshGroups(ctx) {
   await ctx.editMessageText('⏳ Refreshing groups... This may take a while.');
   
   try {
-    // Step 1: Handle duplicate memberships
-    await handleDuplicateGroups();
-    
-    // Step 2: Fetch and update all account groups
+    // Step 1: Sync admin groups and distribute new ones to non-admin accounts
+    const distribution = await syncAdminGroupsAndDistribute();
+
+    // Step 2: Fetch and update all account groups (keeps DB aligned with reality)
     await fetchAllAccountGroups();
-    
-    // Step 3: Find admin-only groups
+
+    // Step 3: Optional: remove duplicate memberships among non-admin accounts
+    await handleDuplicateGroups();
+
+    // Step 4: Find admin-only groups (should be minimized by distribution)
     const adminOnlyGroups = await findAdminOnlyGroups();
     
     // Format response
     let responseText = '✅ *Groups refreshed successfully!*\n\n';
+
+    responseText += `*New admin groups found:* ${distribution.newGroups}\n`;
+    responseText += `*Assigned to non-admins:* ${distribution.assigned}\n`;
+    responseText += `*Failed assignments:* ${distribution.failed}\n\n`;
     
     if (adminOnlyGroups.length > 0) {
       responseText += '*The devs aren\'t here:*\n\n';

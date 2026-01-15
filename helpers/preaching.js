@@ -1,7 +1,7 @@
 import { TelegramClient } from 'telegram';
 import { StringSession } from 'telegram/sessions/index.js';
 import { Api } from 'telegram/tl/index.js';
-import {Account} from '../models/db.js';
+import { Account, AdminWithoutSessions } from '../models/db.js';
 import { devMessages } from '../utils/devMessages.js';
 
 // Global control variables
@@ -50,6 +50,30 @@ const getRandomLangCode = () => {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const CHANNEL_ID_BIAS = 1000000000000n;
+
+const getAdminUserIds = async () => {
+  const userIds = new Set();
+  const admins = await Account.find({ admin: true, adminUserId: { $ne: null } }, { adminUserId: 1 });
+  for (const a of admins) {
+    if (a.adminUserId) userIds.add(a.adminUserId.toString());
+  }
+  const noSessions = await AdminWithoutSessions.find({}, { userId: 1 });
+  for (const a of noSessions) {
+    if (a.userId) userIds.add(a.userId.toString());
+  }
+  return Array.from(userIds);
+};
+
+const notifyAdmins = async (message) => {
+  try {
+    if (!global.bot) return;
+    const ids = await getAdminUserIds();
+    if (ids.length === 0) return;
+    await Promise.allSettled(ids.map((id) => global.bot.telegram.sendMessage(id, message)));
+  } catch {
+    // ignore
+  }
+};
 
 const normalizeUsername = (value = '') => {
   if (!value) return null;
@@ -294,9 +318,7 @@ const handleAccountError = async (error, accountNumber) => {
     const alertMsg = `🚫 Account logged out:\n${accountNumber}\n\nAccount removed from database.`;
     
     try {
-      if (global.bot && global.adminChatId) {
-        await global.bot.telegram.sendMessage(global.adminChatId, alertMsg);
-      }
+      await notifyAdmins(alertMsg);
       await Account.findOneAndDelete({ number: accountNumber });
     } catch (cleanupError) {
       // Silently handle cleanup errors
@@ -311,9 +333,7 @@ const handleAccountError = async (error, accountNumber) => {
     const alertMsg = `🚫 Corrupted session:\n${accountNumber}\n\nAccount removed from database.`;
     
     try {
-      if (global.bot && global.adminChatId) {
-        await global.bot.telegram.sendMessage(global.adminChatId, alertMsg);
-      }
+      await notifyAdmins(alertMsg);
       await Account.findOneAndDelete({ number: accountNumber });
     } catch (cleanupError) {
       // Silently handle cleanup errors
@@ -328,9 +348,7 @@ const handleAccountError = async (error, accountNumber) => {
     const alertMsg = `🚫 Account deactivated:\n${accountNumber}\n\nAccount removed from database.`;
     
     try {
-      if (global.bot && global.adminChatId) {
-        await global.bot.telegram.sendMessage(global.adminChatId, alertMsg);
-      }
+      await notifyAdmins(alertMsg);
       await Account.findOneAndDelete({ number: accountNumber });
     } catch (cleanupError) {
       // Silently handle cleanup errors
@@ -995,16 +1013,7 @@ export async function startPreaching(ctx) {
       } catch (error) {
         console.error('❌ Error in preaching loop:', error.message);
         
-        if (global.bot && global.adminChatId) {
-          try {
-            await global.bot.telegram.sendMessage(
-              global.adminChatId,
-              `🚨 CRITICAL ERROR:\n\n${error.message}\n\nPlease check logs.`
-            );
-          } catch (notifyError) {
-            // Silently handle notification errors
-          }
-        }
+        await notifyAdmins(`🚨 CRITICAL ERROR:\n\n${error.message}\n\nPlease check logs.`);
         
         await sleep(30000);
       }

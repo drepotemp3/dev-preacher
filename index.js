@@ -2,6 +2,8 @@ import {
   handleStart,
   handleAllAccounts,
   handleAddAccount,
+  handleAddAccountAdmin,
+  handleAddAccountNonAdmin,
   handleRefreshGroups,
   handleSetReportChannel,
   handleRestartMonitoring,
@@ -14,6 +16,7 @@ import {
 import dotenv from "dotenv";
 import { Telegraf } from "telegraf";
 import { connectDB } from "./models/db.js";
+import { Account, AdminWithoutSessions, FinderMessage, System } from "./models/db.js";
 import { startPreaching, stopPreaching } from "./helpers/preaching.js";
 import { startMessageMonitoring, stopMessageMonitoring } from "./helpers/messageMonitor.js";
 import launchBot from "./helpers/launchbot.js";
@@ -23,8 +26,24 @@ dotenv.config();
 const app = express();
 const bot = new Telegraf(process.env.BOT_TOKEN);
 global.bot = bot;
-global.adminChatId = 1632962204; // Admin chat ID for notifications
-global.adminUsername = '@endurenow';
+
+async function isAdminUserId(userId) {
+  const id = userId?.toString();
+  if (!id) return false;
+  const accountAdmin = await Account.findOne({ admin: true, adminUserId: id });
+  if (accountAdmin) return true;
+  const adminNoSession = await AdminWithoutSessions.findOne({ userId: id });
+  return !!adminNoSession;
+}
+
+async function ensureSystemDoc() {
+  let doc = await System.findOne({});
+  if (!doc) {
+    doc = new System({});
+    await doc.save();
+  }
+  return doc;
+}
 
 app.get("/ping", (req, res) => {
   res.send("Pong");
@@ -38,6 +57,8 @@ app.listen(PORT, () => {
 bot.start(handleStart)
 bot.action("all_accounts", handleAllAccounts);
 bot.action("add_account", handleAddAccount);
+bot.action("add_account_admin", handleAddAccountAdmin);
+bot.action("add_account_nonadmin", handleAddAccountNonAdmin);
 bot.action("refresh_groups", handleRefreshGroups);
 bot.action("set_report_channel", handleSetReportChannel);
 bot.action("start_preaching", startPreaching)
@@ -85,6 +106,129 @@ bot.on("text", async (ctx) => {
 });
 
 bot.telegram.setMyCommands([{command:"/start", description:"Start the bot"}])
+
+// Admin commands
+bot.command("groupId", async (ctx) => {
+  // Only meaningful in groups/supergroups/channels
+  const chatType = ctx.chat?.type;
+  if (!chatType || (chatType !== "group" && chatType !== "supergroup" && chatType !== "channel")) {
+    return ctx.reply("Use this command inside a group.");
+  }
+
+  const chatId = ctx.chat?.id?.toString?.() || "";
+  return ctx.reply(chatId ? `Group ID: ${chatId}` : "Could not read group id.");
+});
+
+bot.command("set_dump", async (ctx) => {
+  if (!(await isAdminUserId(ctx.from.id))) {
+    return ctx.reply("Not allowed.");
+  }
+
+  const parts = (ctx.message.text || "").trim().split(/\s+/);
+  const groupId = parts[1];
+  if (!groupId) {
+    return ctx.reply("Usage: /set_dump {groupId}");
+  }
+
+  const doc = await ensureSystemDoc();
+  doc.dumpGroupId = groupId.toString();
+  await doc.save();
+
+  await ctx.reply(`✅ Dump group set to: ${groupId}`);
+});
+
+bot.command("set_admin", async (ctx) => {
+  if (!(await isAdminUserId(ctx.from.id))) {
+    return;
+  }
+
+  const parts = (ctx.message.text || "").trim().split(/\s+/);
+  const arg = parts[1];
+  if (!arg) {
+    return ctx.reply("Usage: /set_admin {username|userId}");
+  }
+
+  const isNumeric = /^\d+$/.test(arg);
+  let username = null;
+  let userId = null;
+
+  if (isNumeric) {
+    userId = arg;
+  } else {
+    username = arg.replace("@", "").trim();
+    // Try resolving userId via Bot API
+    try {
+      const chat = await bot.telegram.getChat(`@${username}`);
+      userId = chat?.id?.toString?.() || null;
+    } catch {
+      // leave userId null if cannot resolve
+    }
+  }
+
+  // If an Account exists with that username, mark it admin and store adminUserId if we have it
+  let updated = false;
+  if (username) {
+    const acc = await Account.findOne({ username });
+    if (acc) {
+      await Account.updateOne(
+        { _id: acc._id },
+        { $set: { admin: true, ...(userId ? { adminUserId: userId } : {}) } }
+      );
+      updated = true;
+    }
+  }
+
+  if (isNumeric) {
+    const accByAdminUserId = await Account.findOne({ adminUserId: userId });
+    if (accByAdminUserId) {
+      await Account.updateOne({ _id: accByAdminUserId._id }, { $set: { admin: true } });
+      updated = true;
+    }
+  }
+
+  if (updated) {
+    return ctx.reply(`✅ Admin set for ${username ? `@${username}` : userId}${userId ? ` (userId: ${userId})` : ""}`);
+  }
+
+  // Otherwise store in AdminWithoutSessions (must have userId)
+  if (!userId) {
+    return ctx.reply("❌ Could not resolve userId for that username. Please pass a numeric userId instead.");
+  }
+
+  await AdminWithoutSessions.updateOne(
+    { userId },
+    { $set: { userId, username: username || null } },
+    { upsert: true }
+  );
+
+  return ctx.reply(`✅ Admin added (no session): ${username ? `@${username}` : ""} userId=${userId}`);
+});
+
+// Finder messages "Completed" button
+bot.action(/^finder_done:(.+)$/, async (ctx) => {
+  if (!(await isAdminUserId(ctx.from.id))) {
+    return ctx.answerCbQuery("Not allowed");
+  }
+
+  const finderId = ctx.match[1];
+  const record = await FinderMessage.findById(finderId);
+  if (!record) {
+    await ctx.answerCbQuery("Already handled");
+    return;
+  }
+
+  try {
+    await bot.telegram.deleteMessage(record.dumpGroupId, record.dumpMessageId);
+  } catch {
+    // ignore
+  }
+
+  await FinderMessage.deleteOne({ _id: finderId });
+
+  try {
+    await ctx.answerCbQuery("Completed");
+  } catch {}
+});
 // ============================================
 // Initialize Bot
 // ============================================
