@@ -159,6 +159,8 @@ async function startMonitoringAccount(account) {
 
     monitoringClients.set(account.number, { client, username: accountUsername });
 
+    console.log(`✅ Monitoring started for admin account: ${accountUsername}`);
+
     // Set up disconnect handler
     client.addEventHandler(async (update) => {
       if (update.className === 'UpdateConnectionState') {
@@ -187,13 +189,13 @@ async function startMonitoringAccount(account) {
           const userId = sender.id.toString();
           const content = message.text || '[Media message]';
 
-          // Handle DMs
+          // Handle DMs to admin accounts
           if (event.isPrivate) {
             // Check if customer already exists
             const existingCustomer = await Customer.findOne({ userId: userId });
 
             if (!existingCustomer) {
-              // First message - save, notify, and reply
+              // First message - save and notify
               const customer = new Customer({
                 username: username,
                 userId: userId,
@@ -206,14 +208,13 @@ async function startMonitoringAccount(account) {
               await customer.save();
 
               // Send notification to admin
-              const notificationMessage = `🔔 New DM to ${accountUsername}\n\nFrom: ${username} | ID: ${userId}\n\nMessage: ${truncate50(content)}`;
+              const notificationMessage = `📩 New DM to ${accountUsername}\n\nFrom: ${username} | ID: ${userId}\n\nMessage: ${truncate50(content)}`;
               await notifyAdmins(notificationMessage);
             }
-            // If customer exists, ignore subsequent messages
             return;
           }
 
-          // Group replies to OUR message => notify admins (and store in Customer if new)
+          // Group replies to admin account messages => notify admins
           if (event.isGroup && message.replyTo && message.replyTo.replyToMsgId) {
             try {
               const chat = await message.getChat();
@@ -236,7 +237,7 @@ async function startMonitoringAccount(account) {
 
                 const link = await buildMessageLink(client, message);
                 const groupName = chat?.title || 'Unknown Group';
-                const notificationMessage = `🔔 New reply to ${accountUsername}\n\nFrom: ${username} | ID: ${userId}\n\nGroup: ${groupName}\nLink: ${link}\n\nMessage: ${truncate50(content)}`;
+                const notificationMessage = `📩 New reply to ${accountUsername}\n\nFrom: ${username} | ID: ${userId}\n\nGroup: ${groupName}\nLink: ${link}\n\nMessage: ${truncate50(content)}`;
                 await notifyAdmins(notificationMessage, { disable_web_page_preview: true });
                 return;
               }
@@ -245,20 +246,32 @@ async function startMonitoringAccount(account) {
             }
           }
 
-          // Finder mode: keyword detection across groups => forward to dump group (if configured)
+          // ==========================================
+          // KEYWORD DETECTION (FINDER MODE)
+          // This is the main feature - detect keywords in group messages
+          // ==========================================
           if (event.isGroup && !event.isPrivate) {
             const dumpGroupId = await getDumpGroupId();
-            if (!dumpGroupId) return;
+            if (!dumpGroupId) {
+              // No dump group configured - skip keyword detection
+              return;
+            }
 
+            // Skip if no text content
             if (!content || content === '[Media message]') return;
+
+            // Check for keywords
             if (!containsFindingKeyword(content)) return;
 
             // Only save if sender not in Customer collection already
             const existingCustomer = await Customer.findOne({ userId: userId });
             if (existingCustomer) return;
 
+            // Build message link
             const link = await buildMessageLink(client, message);
             if (!link) return;
+
+            console.log(`🔍 Keyword detected in message from ${username}`);
 
             // Save customer as finding-a-dev
             const customer = new Customer({
@@ -272,11 +285,17 @@ async function startMonitoringAccount(account) {
             });
             await customer.save();
 
-            // Send to dump group with button, store message ids
+            // Send to dump group with proper format and button
+            const chat = await message.getChat();
+            const groupName = chat?.title || 'Unknown Group';
+            
             const dumpText =
+              `🔍 Keyword Detected!\n\n` +
+              `From: ${username} | ID: ${userId}\n` +
+              `Group: ${groupName}\n\n` +
               `Message: ${truncate50(content)}\n\n` +
               `Link: ${link}\n\n` +
-              `Completed`;
+              `Click "Completed" when done`;
 
             const sent = await global.bot.telegram.sendMessage(
               dumpGroupId,
@@ -284,7 +303,7 @@ async function startMonitoringAccount(account) {
               {
                 disable_web_page_preview: true,
                 reply_markup: {
-                  inline_keyboard: [[{ text: 'Completed', callback_data: 'finder_done_pending' }]],
+                  inline_keyboard: [[{ text: '✅ Completed', callback_data: 'finder_done_pending' }]],
                 },
               }
             );
@@ -300,12 +319,15 @@ async function startMonitoringAccount(account) {
               preview: truncate50(content),
             });
 
+            // Update button with actual finder ID
             await global.bot.telegram.editMessageReplyMarkup(
               dumpGroupId,
               sent.message_id,
               undefined,
-              { inline_keyboard: [[{ text: 'Completed', callback_data: `finder_done:${finder._id.toString()}` }]] }
+              { inline_keyboard: [[{ text: '✅ Completed', callback_data: `finder_done:${finder._id.toString()}` }]] }
             );
+
+            console.log(`✅ Forwarded to dump group: ${dumpGroupId}`);
           }
         } catch (error) {
           console.error(`Error processing message for ${accountUsername}:`, error);
@@ -333,22 +355,13 @@ async function startMonitoringAccount(account) {
     // Store health check interval
     reconnectIntervals.set(account.number, healthCheckInterval);
 
-    console.log(`✅ Monitoring started for account: ${accountUsername}`);
-
   } catch (error) {
     const errorMsg = error?.errorMessage || error?.message || '';
     const errorCode = error?.code;
     
-    // Handle AUTH_KEY_DUPLICATED - session is being used elsewhere
-    if (errorCode === 406 || errorMsg.includes('AUTH_KEY_DUPLICATED')) {
-      console.warn(`⚠️  Account ${account.number}: Session is being used by another client (preaching system). Monitoring will be skipped for this account.`);
-      console.warn(`   This is normal when the preaching system is active. Monitoring will resume when preaching stops.`);
-      return; // Don't retry - this account is being used for preaching
-    }
-    
     console.error(`❌ Error starting monitoring for account ${account.number}:`, error);
     
-    // Retry after delay if initial connection fails (but not for AUTH_KEY_DUPLICATED)
+    // Retry after delay if initial connection fails
     setTimeout(() => {
       console.log(`🔄 Retrying monitoring for ${account.number}...`);
       startMonitoringAccount(account);
@@ -356,22 +369,28 @@ async function startMonitoringAccount(account) {
   }
 }
 
-// Start monitoring for all accounts
+// Start monitoring for all ADMIN accounts
 export async function startMessageMonitoring() {
   try {
-    const accounts = await Account.find({ admin: false });
+    // ========================================
+    // KEY CHANGE: Use admin accounts instead of non-admin accounts
+    // ========================================
+    const accounts = await Account.find({ admin: true });
 
     if (accounts.length === 0) {
-      console.log('ℹ️ No non-admin accounts found for monitoring');
+      console.log('ℹ️ No admin accounts found for monitoring');
+      console.log('⚠️ Please add at least one admin account to enable keyword detection');
       return;
     }
+
+    console.log(`🚀 Starting message monitoring with ${accounts.length} admin account(s)...`);
 
     for (const account of accounts) {
       await startMonitoringAccount(account);
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
 
-    console.log(`✅ Message monitoring started for ${accounts.length} accounts`);
+    console.log(`✅ Message monitoring started for ${accounts.length} admin account(s)`);
 
   } catch (error) {
     console.error('❌ Error starting message monitoring:', error);
